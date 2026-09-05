@@ -1,52 +1,161 @@
-from langchain_openai import ChatOpenAI
-from langchain_core.tools import tool
+import os
 import requests
-from langchain_community.tools import DuckDuckGoSearchRun
-from langchain.agents import create_react_agent, AgentExecutor
-from langchain import hub
+
 from dotenv import load_dotenv
+
+from langchain_groq import ChatGroq
+from langchain_tavily import TavilySearch
+from langchain.agents import create_agent
+from langchain_core.tools import tool
+
+
+# =========================
+# Load environment variables
+# =========================
 
 load_dotenv()
 
-search_tool = DuckDuckGoSearchRun()
+
+os.environ["LANGSMITH_TRACING"] = "true"
+os.environ["LANGSMITH_PROJECT"] = "your_langsmith_project"
+
+
+
+# =========================
+# Search Tool
+# =========================
+
+search_tool = TavilySearch(
+    max_results=5
+)
+
+
+# =========================
+# Weather Tool
+# =========================
 
 @tool
 def get_weather_data(city: str) -> str:
-  """
-  This function fetches the current weather data for a given city
-  """
-  url = f'https://api.weatherstack.com/current?access_key=f07d9636974c4120025fadf60678771b&query={city}'
+    """
+    Get current weather for a city using Open-Meteo.
+    Open-Meteo does NOT require an API key.
+    """
 
-  response = requests.get(url)
+    # Geocoding
+    geo_url = "https://geocoding-api.open-meteo.com/v1/search"
 
-  return response.json()
+    geo_params = {
+        "name": city,
+        "count": 1,
+        "language": "en",
+        "format": "json"
+    }
 
-llm = ChatOpenAI()
+    geo_response = requests.get(
+        geo_url,
+        params=geo_params
+    )
 
-# Step 2: Pull the ReAct prompt from LangChain Hub
-prompt = hub.pull("hwchase17/react")  # pulls the standard ReAct agent prompt
+    geo_data = geo_response.json()
 
-# Step 3: Create the ReAct agent manually with the pulled prompt
-agent = create_react_agent(
-    llm=llm,
-    tools=[search_tool, get_weather_data],
-    prompt=prompt
+    if "results" not in geo_data:
+        return f"Could not find city: {city}"
+
+    location = geo_data["results"][0]
+
+    latitude = location["latitude"]
+    longitude = location["longitude"]
+    city_name = location["name"]
+    country = location.get("country", "")
+
+    # Current weather
+    weather_url = "https://api.open-meteo.com/v1/forecast"
+
+    weather_params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m",
+        "temperature_unit": "celsius"
+    }
+
+    weather_response = requests.get(
+        weather_url,
+        params=weather_params
+    )
+
+    weather_data = weather_response.json()
+
+    current = weather_data["current"]
+
+    return (
+        f"City: {city_name}, {country}\n"
+        f"Temperature: {current['temperature_2m']}°C\n"
+        f"Humidity: {current['relative_humidity_2m']}%\n"
+        f"Wind Speed: {current['wind_speed_10m']} km/h"
+    )
+
+# =========================
+# ChatGroq LLM
+# =========================
+
+llm = ChatGroq(
+    model="openai/gpt-oss-20b",
+    temperature=0
 )
 
-# Step 4: Wrap it with AgentExecutor
-agent_executor = AgentExecutor(
-    agent=agent,
-    tools=[search_tool, get_weather_data],
-    verbose=True,
-    max_iterations=5
+
+# =========================
+# Create Agent
+# =========================
+
+agent = create_agent(
+    model=llm,
+    tools=[
+        search_tool,
+        get_weather_data
+    ],
+    system_prompt="""
+    You are a helpful AI assistant.
+
+    You have two tools:
+
+    1. TavilySearch:
+       Use it for web searches and current information.
+
+    2. get_weather_data:
+       Use it for weather questions.
+       This tool uses Open-Meteo.
+       Open-Meteo does NOT require an API key.
+
+    NEVER ask the user for a weather API key.
+    Always use get_weather_data for weather questions.
+
+    Give clear and concise answers.
+    """
 )
 
-# What is the release date of Dhadak 2?
-# What is the current temp of gurgaon
-# Identify the birthplace city of Kalpana Chawla (search) and give its current temperature.
 
-# Step 5: Invoke
-response = agent_executor.invoke({"input": "What is the current temp of gurgaon"})
-print(response)
+# =========================
+# Run Agent
+# =========================
 
-print(response['output'])
+while True:
+
+    user_input = input("\nYou: ")
+
+    if user_input.lower() in ["exit", "quit"]:
+        print("Goodbye!")
+        break
+
+    response = agent.invoke(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": user_input
+                }
+            ]
+        }
+    )
+
+    print("\nAI:", response["messages"][-1].content)
